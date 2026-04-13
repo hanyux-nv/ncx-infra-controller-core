@@ -2353,6 +2353,7 @@ dependencies = [
  "async-ssh2-tokio",
  "humantime",
  "russh",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
