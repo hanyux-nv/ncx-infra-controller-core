@@ -1380,6 +1380,8 @@ func (umh UpdateMachineHandler) Handle(c echo.Context) error {
 		// no timeout occurred and the normal flow continues.
 		var timeoutResp func() error
 
+		statusDetailDAO := cdbm.NewStatusDetailDAO(umh.dbSession)
+
 		err := cdb.WithTx(ctx, umh.dbSession, func(orTx *cdb.Tx) error {
 			iDAO := cdbm.NewInstanceDAO(umh.dbSession)
 			instances, _, derr := iDAO.GetAll(ctx, orTx, cdbm.InstanceFilterInput{MachineIDs: []string{machine.ID}}, cdbp.PageInput{Limit: cdb.GetIntPtr(1)}, nil)
@@ -1424,6 +1426,13 @@ func (umh UpdateMachineHandler) Handle(c echo.Context) error {
 					return cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Instance for online repair", nil)
 				}
 
+				// Update Instance status in StatusDetail
+				_, derr = statusDetailDAO.CreateFromParams(ctx, orTx, inst.ID.String(), cdbm.InstanceStatusRepairing, cdb.GetStrPtr("Instance is currently being repaired"))
+				if derr != nil {
+					logger.Error().Err(derr).Msg("error updating Instance status in StatusDetail for online repair in DB")
+					return cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Instance status in StatusDetail for online repair", nil)
+				}
+
 				wfOpts := temporalClient.StartWorkflowOptions{
 					ID:                       "site-machine-online-repair-" + machine.ID,
 					WorkflowExecutionTimeout: cutil.WorkflowExecutionTimeout,
@@ -1457,8 +1466,21 @@ func (umh UpdateMachineHandler) Handle(c echo.Context) error {
 				}
 				logger.Info().Str("Workflow ID", wid).Msg("completed synchronous applying online repair health override workflow")
 			} else {
-				if inst.Status != cdbm.InstanceStatusRepairing {
-					return cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("Instance must be in Repairing state to exit online repair (current state: %s)", inst.Status), nil)
+				// Validate if Instance is in Repairing state, has the online repair marker label, or the Machine health includes the online repair health alert
+				_, hasOnlineRepairLabel := inst.Labels[model.InstanceLabelOnlineRepairAllowAutoDeletion]
+
+				// Check if Machine health includes the online repair health alert
+				hasOnlineRepairHealthAlert := false
+				health, err := machine.GetHealth()
+				if err == nil && health != nil {
+					hasOnlineRepairHealthAlert = health.HasAlertID(model.MachineHealthAlertIDOnlineRepair)
+				}
+
+				// Validate if Instance is in Repairing state, has the online repair marker label, or the Machine health includes the online repair health alert
+				if inst.Status != cdbm.InstanceStatusRepairing && !hasOnlineRepairLabel && !hasOnlineRepairHealthAlert {
+					return cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf(
+						"Instance must be in Repairing state, retain the online repair marker label (%s), or the Machine health must include the %s alert (synced from Site) to exit online repair (current instance state: %s)",
+						model.InstanceLabelOnlineRepairAllowAutoDeletion, model.MachineHealthAlertIDOnlineRepair, inst.Status), nil)
 				}
 
 				instanceLabels := maps.Clone(inst.Labels)
@@ -1476,6 +1498,13 @@ func (umh UpdateMachineHandler) Handle(c echo.Context) error {
 				if derr != nil {
 					logger.Error().Err(derr).Msg("error updating Instance after clearing online repair in DB")
 					return cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Instance after clearing online repair", nil)
+				}
+
+				// Update Instance status in StatusDetail
+				_, derr = statusDetailDAO.CreateFromParams(ctx, orTx, inst.ID.String(), cdbm.InstanceStatusReady, cdb.GetStrPtr("Instance repair has been completed, ready for use"))
+				if derr != nil {
+					logger.Error().Err(derr).Msg("error updating Instance status in StatusDetail for online repair exit in DB")
+					return cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Instance status in StatusDetail for online repair exit", nil)
 				}
 
 				rmReq, perr := apiRequest.ToRemoveHealthReportOverrideProto(machine.ID)
